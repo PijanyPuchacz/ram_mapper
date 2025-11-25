@@ -1,0 +1,8 @@
+[package]
+name = "ram_mapper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+structopt = "0.3.26"
+verbose-macros = "0.1.1"
