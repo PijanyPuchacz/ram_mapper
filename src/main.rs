@@ -219,11 +219,11 @@ fn main() {
                 verbose!("Attempting to break loop");
                 //attempt fix -> move 128K to LUTRAM
                 //Vector should be sorted from smallest logical ram to largest, so finding first 128k should be the smallest one to convert now
-                let ram = match circuit
-                    .ram_mappings
-                    .iter()
-                    .position(|x| x.ram_type == RamType::RAM128K && x.mode != RamMode::TrueDualPort)
-                {
+                let ram = match circuit.ram_mappings.iter().position(|x| {
+                    x.ram_type == RamType::RAM128K
+                        && x.mode != RamMode::TrueDualPort
+                        && x.logical_depth / 64 < 17
+                }) {
                     Some(ram) => ram,
                     None => {
                         /* not possible without wasting LB slots, just add more to the calculation and keep trying, fuck test 61 */
@@ -323,21 +323,22 @@ fn main() {
                 //attempt fix -> move to LUTRAM
                 let mut map_to = RamType::LUTRAM;
                 //Vector should be sorted from smallest logical ram to largest, so finding first 8k should be the smallest one to convert now
-                let ram =
-                    match circuit.ram_mappings.iter().position(|x| {
-                        x.ram_type == RamType::RAM8K && x.mode != RamMode::TrueDualPort
-                    }) {
-                        Some(ram) => ram,
-                        None => {
-                            /* Could not find valid target to map, try to map to 128K instead*/
-                            map_to = RamType::RAM128K;
-                            circuit
-                                .ram_mappings
-                                .iter()
-                                .position(|x| x.ram_type == RamType::RAM8K)
-                                .unwrap()
-                        }
-                    };
+                let ram = match circuit.ram_mappings.iter().position(|x| {
+                    x.ram_type == RamType::RAM8K    // Find RAM8K That isn't a truedualport and is not too deep to map to LUTRAM
+                        && x.mode != RamMode::TrueDualPort
+                        && x.logical_depth / 64 < 17
+                }) {
+                    Some(ram) => ram,
+                    None => {
+                        /* Could not find valid target to map, try to map to 128K instead*/
+                        map_to = RamType::RAM128K;
+                        circuit
+                            .ram_mappings
+                            .iter()
+                            .position(|x| x.ram_type == RamType::RAM8K)
+                            .unwrap()
+                    }
+                };
                 verbose!(
                     "Circuit {} remapping: {:?}",
                     circuit.id,
@@ -484,7 +485,7 @@ fn main() {
 
     fn map_ram(parsed: &ParsedRam, map_to: RamType) -> RamMapping {
         let mut lb_usage = 0;
-        let mut serial = 0;
+        let mut serial = 17;
         let mut parrallel = 0;
         let mut actual_depth = 0;
         let mut actual_width = 0;
@@ -502,27 +503,36 @@ fn main() {
             },
         };
 
-        // Width Map
-        let mut counter = 1;
-        while actual_width == 0 {
-            for try_width in &ram_size.1 {
-                if try_width * counter / parsed.width >= 1 {
-                    actual_width = try_width.to_owned();
-                    parrallel = counter;
-                    break;
-                }
-            }
-            counter += 1;
-        }
+        let mut loop_counter = 0;
 
-        // Depth Map
-        counter = 1;
-        while actual_depth == 0 {
-            if ((counter * ram_size.0) / actual_width) / parsed.depth > 0 {
-                serial = counter;
-                actual_depth = ram_size.0 / actual_width;
+        // Map loop to check for Serial > 16
+        while serial > 16 {
+            loop_counter += 1;
+            actual_width = 0;
+            actual_depth = 0;
+
+            // Width Map
+            let mut counter = loop_counter;
+            while actual_width == 0 {
+                for try_width in &ram_size.1 {
+                    if try_width * counter / parsed.width >= 1 {
+                        actual_width = try_width.to_owned();
+                        parrallel = counter;
+                        break;
+                    }
+                }
+                counter += 1;
             }
-            counter += 1;
+
+            // Depth Map
+            counter = 1;
+            while actual_depth == 0 {
+                if ((counter * ram_size.0) / actual_width) / parsed.depth > 0 {
+                    serial = counter;
+                    actual_depth = ram_size.0 / actual_width;
+                }
+                counter += 1;
+            }
         }
 
         // Determine cost of addtional logic
@@ -534,7 +544,13 @@ fn main() {
             _ => serial,
         };
 
-        lb_usage = (additional_lut_mux + additional_lut_dec + LB_N - 1) / LB_N; // Integer divide but round up instead of down.
+        // If we're using a true dual mode RAM we need to double the LUTs used for muxing and decoding.
+        let true_dual_mod = match parsed.mode {
+            RamMode::TrueDualPort => 2,
+            _ => 1,
+        };
+
+        lb_usage = (true_dual_mod * (additional_lut_mux + additional_lut_dec) + LB_N - 1) / LB_N; // Integer divide but round up instead of down.
 
         // If this is a LUTRAM also add that cost
         if map_to == RamType::LUTRAM {
