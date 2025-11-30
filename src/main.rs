@@ -92,6 +92,9 @@ fn main() {
     let opt = Opt::from_args();
     verbose_macros::set_verbose(opt.verbose);
 
+    use std::time::Instant;
+    let start = Instant::now();
+
     verbose!("Opening file: {}", opt.file_path_ram);
 
     // Open File and read lines for RAM
@@ -141,6 +144,8 @@ fn main() {
     //              from 128k -> 8k if too many 128k, smallest -> largest until ratio is satisfied
     //              from 8k -> LUTRAM if too many 8k, smallest -> largest until ratio is satisfied
     // end, print results to output file.
+
+    let start_mapping = Instant::now();
 
     for line in rams {
         let parsed_ram = ram_parse(line.unwrap().as_str());
@@ -412,6 +417,9 @@ fn main() {
         }
     }
 
+    let elapsed = start_mapping.elapsed();
+    println!("Time to map RAM: {:.5?}", elapsed);
+
     // Print solutions to file
     let mut file = File::create("ram_mappings.txt").unwrap();
     for circuit in circuits {
@@ -440,134 +448,137 @@ fn main() {
         }
     }
 
-    fn ram_parse(ram_string: &str) -> ParsedRam {
-        let mut parsed_ram: ParsedRam = ParsedRam {
-            circuit_id: 0,
-            ram_id: 0,
-            mode: RamMode::ROM,
-            depth: 0,
-            width: 0,
-        };
+    let elapsed = start_mapping.elapsed();
+    println!("Time for full run: {:.5?}", elapsed);
+}
 
-        let mut string_split = ram_string.split("\t");
+fn ram_parse(ram_string: &str) -> ParsedRam {
+    let mut parsed_ram: ParsedRam = ParsedRam {
+        circuit_id: 0,
+        ram_id: 0,
+        mode: RamMode::ROM,
+        depth: 0,
+        width: 0,
+    };
 
-        //println!("{string_split:?}");
+    let mut string_split = ram_string.split("\t");
 
-        parsed_ram.circuit_id = string_split.next().unwrap().parse::<u32>().unwrap();
-        parsed_ram.ram_id = string_split.next().unwrap().parse::<u32>().unwrap();
-        parsed_ram.mode = match string_split.next().unwrap() {
-            "ROM           " => RamMode::ROM,
-            "SinglePort    " => RamMode::SinglePort,
-            "SimpleDualPort" => RamMode::SimpleDualPort,
-            "TrueDualPort  " => RamMode::TrueDualPort,
-            _ => panic!("Error Parsing RAM Mode"),
-        };
-        parsed_ram.depth = string_split.next().unwrap().parse::<u32>().unwrap();
-        parsed_ram.width = string_split.next().unwrap().parse::<u32>().unwrap();
+    //println!("{string_split:?}");
 
-        parsed_ram
+    parsed_ram.circuit_id = string_split.next().unwrap().parse::<u32>().unwrap();
+    parsed_ram.ram_id = string_split.next().unwrap().parse::<u32>().unwrap();
+    parsed_ram.mode = match string_split.next().unwrap() {
+        "ROM           " => RamMode::ROM,
+        "SinglePort    " => RamMode::SinglePort,
+        "SimpleDualPort" => RamMode::SimpleDualPort,
+        "TrueDualPort  " => RamMode::TrueDualPort,
+        _ => panic!("Error Parsing RAM Mode"),
+    };
+    parsed_ram.depth = string_split.next().unwrap().parse::<u32>().unwrap();
+    parsed_ram.width = string_split.next().unwrap().parse::<u32>().unwrap();
+
+    parsed_ram
+}
+
+fn lb_parse(lb_string: &str) -> Circuit {
+    let mut circuit: Circuit = Circuit {
+        id: 0,
+        logic_lb_usage: 0,
+        ram_mappings: Vec::new(),
+    };
+
+    let mut string_split = lb_string.split("\t");
+
+    circuit.id = string_split.next().unwrap().parse::<u32>().unwrap();
+    circuit.logic_lb_usage = string_split.next().unwrap().parse::<u32>().unwrap();
+
+    circuit
+}
+
+fn map_ram(parsed: &ParsedRam, map_to: RamType) -> RamMapping {
+    let mut lb_usage = 0;
+    let mut serial = 17;
+    let mut parrallel = 0;
+    let mut actual_depth = 0;
+    let mut actual_width = 0;
+
+    let ram_size = match parsed.mode {
+        RamMode::TrueDualPort => match map_to {
+            RamType::RAM128K => (RAM128K_BYTES, Vec::from([1, 2, 4, 8, 16, 32, 64])),
+            RamType::RAM8K => (RAM8K_BYTES, Vec::from([1, 2, 4, 8, 16])),
+            RamType::LUTRAM => panic!("Error! Cannot map TrueDualPort to LUTRAM!"),
+        },
+        _ => match map_to {
+            RamType::RAM128K => (RAM128K_BYTES, Vec::from([1, 2, 4, 8, 16, 32, 64, 128])),
+            RamType::RAM8K => (RAM8K_BYTES, Vec::from([1, 2, 4, 8, 16, 32])),
+            RamType::LUTRAM => (LUTRAM_BYTES, Vec::from([10, 20])),
+        },
+    };
+
+    let mut loop_counter = 0;
+
+    // Map loop to check for Serial > 16
+    while serial > 16 {
+        loop_counter += 1;
+        actual_width = 0;
+        actual_depth = 0;
+
+        // Width Map
+        let mut counter = loop_counter;
+        while actual_width == 0 {
+            for try_width in &ram_size.1 {
+                if try_width * counter / parsed.width >= 1 {
+                    actual_width = try_width.to_owned();
+                    parrallel = counter;
+                    break;
+                }
+            }
+            counter += 1;
+        }
+
+        // Depth Map
+        counter = 1;
+        while actual_depth == 0 {
+            if ((counter * ram_size.0) / actual_width) / parsed.depth > 0 {
+                serial = counter;
+                actual_depth = ram_size.0 / actual_width;
+            }
+            counter += 1;
+        }
     }
 
-    fn lb_parse(lb_string: &str) -> Circuit {
-        let mut circuit: Circuit = Circuit {
-            id: 0,
-            logic_lb_usage: 0,
-            ram_mappings: Vec::new(),
-        };
+    // Determine cost of addtional logic
+    // Additional LB for serial RAMs Decoding and Multiplexing
+    let additional_lut_mux = parsed.width * ((serial + 1) / 3);
+    let additional_lut_dec = match serial {
+        1 => 0,
+        2 => 1,
+        _ => serial,
+    };
 
-        let mut string_split = lb_string.split("\t");
+    // If we're using a true dual mode RAM we need to double the LUTs used for muxing and decoding.
+    let true_dual_mod = match parsed.mode {
+        RamMode::TrueDualPort => 2,
+        _ => 1,
+    };
 
-        circuit.id = string_split.next().unwrap().parse::<u32>().unwrap();
-        circuit.logic_lb_usage = string_split.next().unwrap().parse::<u32>().unwrap();
+    lb_usage = (true_dual_mod * (additional_lut_mux + additional_lut_dec) + LB_N - 1) / LB_N; // Integer divide but round up instead of down.
 
-        circuit
+    // If this is a LUTRAM also add that cost
+    if map_to == RamType::LUTRAM {
+        lb_usage += serial * parrallel;
     }
 
-    fn map_ram(parsed: &ParsedRam, map_to: RamType) -> RamMapping {
-        let mut lb_usage = 0;
-        let mut serial = 17;
-        let mut parrallel = 0;
-        let mut actual_depth = 0;
-        let mut actual_width = 0;
-
-        let ram_size = match parsed.mode {
-            RamMode::TrueDualPort => match map_to {
-                RamType::RAM128K => (RAM128K_BYTES, Vec::from([1, 2, 4, 8, 16, 32, 64])),
-                RamType::RAM8K => (RAM8K_BYTES, Vec::from([1, 2, 4, 8, 16])),
-                RamType::LUTRAM => panic!("Error! Cannot map TrueDualPort to LUTRAM!"),
-            },
-            _ => match map_to {
-                RamType::RAM128K => (RAM128K_BYTES, Vec::from([1, 2, 4, 8, 16, 32, 64, 128])),
-                RamType::RAM8K => (RAM8K_BYTES, Vec::from([1, 2, 4, 8, 16, 32])),
-                RamType::LUTRAM => (LUTRAM_BYTES, Vec::from([10, 20])),
-            },
-        };
-
-        let mut loop_counter = 0;
-
-        // Map loop to check for Serial > 16
-        while serial > 16 {
-            loop_counter += 1;
-            actual_width = 0;
-            actual_depth = 0;
-
-            // Width Map
-            let mut counter = loop_counter;
-            while actual_width == 0 {
-                for try_width in &ram_size.1 {
-                    if try_width * counter / parsed.width >= 1 {
-                        actual_width = try_width.to_owned();
-                        parrallel = counter;
-                        break;
-                    }
-                }
-                counter += 1;
-            }
-
-            // Depth Map
-            counter = 1;
-            while actual_depth == 0 {
-                if ((counter * ram_size.0) / actual_width) / parsed.depth > 0 {
-                    serial = counter;
-                    actual_depth = ram_size.0 / actual_width;
-                }
-                counter += 1;
-            }
-        }
-
-        // Determine cost of addtional logic
-        // Additional LB for serial RAMs Decoding and Multiplexing
-        let additional_lut_mux = parsed.width * ((serial + 1) / 3);
-        let additional_lut_dec = match serial {
-            1 => 0,
-            2 => 1,
-            _ => serial,
-        };
-
-        // If we're using a true dual mode RAM we need to double the LUTs used for muxing and decoding.
-        let true_dual_mod = match parsed.mode {
-            RamMode::TrueDualPort => 2,
-            _ => 1,
-        };
-
-        lb_usage = (true_dual_mod * (additional_lut_mux + additional_lut_dec) + LB_N - 1) / LB_N; // Integer divide but round up instead of down.
-
-        // If this is a LUTRAM also add that cost
-        if map_to == RamType::LUTRAM {
-            lb_usage += serial * parrallel;
-        }
-
-        RamMapping {
-            id: parsed.ram_id,
-            mode: parsed.mode,
-            logical_depth: parsed.depth,
-            logical_width: parsed.width,
-            lb_usage: lb_usage,
-            ram_type: map_to,
-            serial: serial,
-            parrallel: parrallel,
-            actual_depth: actual_depth,
-            actual_width: actual_width,
-        }
+    RamMapping {
+        id: parsed.ram_id,
+        mode: parsed.mode,
+        logical_depth: parsed.depth,
+        logical_width: parsed.width,
+        lb_usage: lb_usage,
+        ram_type: map_to,
+        serial: serial,
+        parrallel: parrallel,
+        actual_depth: actual_depth,
+        actual_width: actual_width,
     }
 }
