@@ -10,26 +10,20 @@ use verbose_macros::verbose;
 const LB_N: u32 = 10;
 const LB_K: u32 = 6;
 const LB_FRACT: bool = true;
-
-// RAM to LB ratio constants
-const LB_PER_8K: u32 = 10;
-const LB_PER_128K: u32 = 300;
-
 // LUTRAM-LB ratio constant
 const LUTRAM_PER_LB: f32 = 0.5;
-
-// RAM fill ratio to determine where to put a block for initial greedy approach
-const FILL_RATIO128K: u32 = (RAM128K_BYTES as f32 * 0.5) as u32;
-const FILL_RATIO8K: u32 = (RAM8K_BYTES as f32 * 0.25) as u32;
-
-// Other useful constants
-const RAM8K_BYTES: u32 = 8192; // 8,192 bits    1x8 192,     2x4 096,    4x2 048,   8x1 024,    16x512 and  32x256      (32x not availble in TrueDualPort mode)
-const RAM128K_BYTES: u32 = 131072; // 131,072 bits  1x131 072,   2x65 536,   4x32 768,  8x16 384,   16x8 192,   32x4 096,   64x2 048, and   128x1 024 (128x not available in TrueDualPort mode)
-const LUTRAM_BYTES: u32 = 640; // 640 bits      10x64,       20x32
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "options", no_version)]
 struct Opt {
+    /// BRAM config for smaller size, given as "-b1 "<ram_size> <max width> <lb_per_bram>" "
+    #[structopt(short = "-s", default_value = "8192 32 10")]
+    bram_smaller: String,
+
+    /// BRAM config for larger size, given as "-b2 "<ram_size> <max_width> <lb_per_bram>" ", set ram_size = 0 to disable
+    #[structopt(short = "-l", default_value = "131072 128 300")]
+    bram_larger: String,
+
     /// Input file PATH with RAMs to map
     #[structopt(parse(from_str))]
     file_path_ram: String,
@@ -41,6 +35,17 @@ struct Opt {
     /// Verbose output
     #[structopt(short = "-v", long = "--verbose")]
     verbose: bool,
+
+    /// Disable LUTRAM mapping
+    #[structopt(short = "-nl", long = "--no-lutram")]
+    no_lutram: bool,
+}
+
+#[derive(Debug)]
+struct RamConfig {
+    ram_size: u32,
+    max_width: u32,
+    lb_per_bram: u32,
 }
 
 #[derive(Debug)]
@@ -63,8 +68,8 @@ enum RamMode {
 #[derive(Debug, PartialEq)]
 enum RamType {
     LUTRAM,
-    RAM8K,
-    RAM128K,
+    RAM_SMALLER,
+    RAM_LARGER,
 }
 
 #[derive(Debug)]
@@ -94,6 +99,55 @@ fn main() {
 
     use std::time::Instant;
     let start = Instant::now();
+
+    //parse configurations
+    let ram_config: Vec<&str> = opt.bram_smaller.split(" ").collect();
+    let bram_smaller = match ram_config.len() {
+        3 => RamConfig {
+            ram_size: ram_config[0].parse().unwrap(),
+            max_width: ram_config[1].parse().unwrap(),
+            lb_per_bram: ram_config[2].parse().unwrap(),
+        },
+        _ => panic!("Incorrect parameters provided to '-b1'."),
+    };
+    let ram_config: Vec<&str> = opt.bram_larger.split(" ").collect();
+    let bram_larger = match ram_config.len() {
+        3 => RamConfig {
+            ram_size: ram_config[0].parse().unwrap(),
+            max_width: ram_config[1].parse().unwrap(),
+            lb_per_bram: ram_config[2].parse().unwrap(),
+        },
+        _ => panic!("Incorrect parameters provided to '-b2'."),
+    };
+
+    println!("Smaller {:?}", bram_smaller);
+    println!("Larger {:?}", bram_larger);
+    println!("Use LUTRAM {:?}", !opt.no_lutram);
+
+    let FILL_RATIO_LARGER: u32 = (bram_larger.ram_size as f32 * 0.5) as u32;
+    let LB_PER_SMALLER: u32 = bram_smaller.lb_per_bram;
+    let LB_PER_LARGER: u32 = bram_larger.lb_per_bram;
+    let LUTRAM_BYTES: u32 = 640;
+    let SMALLER_BYTES: u32 = bram_smaller.ram_size;
+    let LARGER_BYTES: u32 = bram_larger.ram_size;
+    let mut SMALLER_WIDTHS: Vec<u32> = Vec::new();
+    let mut LARGER_WIDTHS: Vec<u32> = Vec::new();
+    let LUTRAM_WIDTHS: Vec<u32> = Vec::from([10, 20]);
+
+    //generate valid width vectors
+    let mut widths = bram_smaller.max_width;
+    while widths != 1 {
+        SMALLER_WIDTHS.push(widths);
+        widths /= 2;
+    }
+    SMALLER_WIDTHS.reverse();
+
+    let mut widths = bram_larger.max_width;
+    while widths != 1 {
+        LARGER_WIDTHS.push(widths);
+        widths /= 2;
+    }
+    LARGER_WIDTHS.reverse();
 
     verbose!("Opening file: {}", opt.file_path_ram);
 
@@ -159,49 +213,50 @@ fn main() {
         );
 
         let bytes_needed = parsed_ram.depth * parsed_ram.width;
+        let map: RamMapping;
 
         //Initial greedy map to BRAMs only
-        match bytes_needed {
-            FILL_RATIO128K.. =>
-            /* Map to 128K */
-            {
-                verbose!("Mapping to 128K BRAM");
-
-                let map = map_ram(&parsed_ram, RamType::RAM128K);
-
-                verbose!("Mapped: {:?}", map);
-
-                circuits
-                    .iter_mut()
-                    .find(|x| x.id == parsed_ram.circuit_id)
-                    .unwrap()
-                    .ram_mappings
-                    .push(map);
-            }
-            ..FILL_RATIO128K =>
-            /* Map to 8K */
-            {
-                verbose!("Mapping to 8K BRAM");
-
-                let map = map_ram(&parsed_ram, RamType::RAM8K);
-
-                verbose!("Mapped: {:?}", map);
-
-                circuits
-                    .iter_mut()
-                    .find(|x| x.id == parsed_ram.circuit_id)
-                    .unwrap()
-                    .ram_mappings
-                    .push(map);
-            }
+        if bytes_needed > FILL_RATIO_LARGER && bram_larger.ram_size != 0 {
+            /* Map to Larger */
+            verbose!("Mapping to Larger BRAM");
+            map = map_ram(
+                &parsed_ram,
+                RamType::RAM_SMALLER,
+                &LUTRAM_BYTES,
+                &SMALLER_BYTES,
+                &LARGER_BYTES,
+                &SMALLER_WIDTHS,
+                &LARGER_WIDTHS,
+                &LUTRAM_WIDTHS,
+            );
+        } else {
+            /* Map to Smaller */
+            verbose!("Mapping to Smaller BRAM");
+            map = map_ram(
+                &parsed_ram,
+                RamType::RAM_SMALLER,
+                &LUTRAM_BYTES,
+                &SMALLER_BYTES,
+                &LARGER_BYTES,
+                &SMALLER_WIDTHS,
+                &LARGER_WIDTHS,
+                &LUTRAM_WIDTHS,
+            );
         }
+        verbose!("Mapped: {:?}", map);
+        circuits
+            .iter_mut()
+            .find(|x| x.id == parsed_ram.circuit_id)
+            .unwrap()
+            .ram_mappings
+            .push(map);
     }
 
     // check legality of solutions
     for circuit in circuits.iter_mut() {
         let mut logic_block_usage = circuit.logic_lb_usage;
-        let mut ram_128K = 0;
-        let mut ram_8K = 0;
+        let mut ram_larger = 0;
+        let mut ram_smaller = 0;
         let mut lutram = 0;
 
         let mut legal = false;
@@ -225,9 +280,10 @@ fn main() {
                 //attempt fix -> move 128K to LUTRAM
                 //Vector should be sorted from smallest logical ram to largest, so finding first 128k should be the smallest one to convert now
                 let ram = match circuit.ram_mappings.iter().position(|x| {
-                    x.ram_type == RamType::RAM128K
+                    x.ram_type == RamType::RAM_LARGER
                         && x.mode != RamMode::TrueDualPort
                         && x.logical_depth / 64 < 17
+                        && !opt.no_lutram // and if lutram is allowed
                 }) {
                     Some(ram) => ram,
                     None => {
@@ -252,6 +308,12 @@ fn main() {
                         width: circuit.ram_mappings[ram].logical_width,
                     },
                     RamType::LUTRAM,
+                    &LUTRAM_BYTES,
+                    &SMALLER_BYTES,
+                    &LARGER_BYTES,
+                    &SMALLER_WIDTHS,
+                    &LARGER_WIDTHS,
+                    &LUTRAM_WIDTHS,
                 );
 
                 verbose!("Remapped to: {:?}", remap);
@@ -264,15 +326,15 @@ fn main() {
 
             // sum all LB and RAM counts
             lutram = 0;
-            ram_8K = 0;
-            ram_128K = 0;
+            ram_smaller = 0;
+            ram_larger = 0;
             logic_block_usage = circuit.logic_lb_usage;
             for ram in &circuit.ram_mappings {
                 logic_block_usage += ram.lb_usage;
                 match ram.ram_type {
                     RamType::LUTRAM => lutram += ram.parrallel * ram.serial,
-                    RamType::RAM8K => ram_8K += ram.parrallel * ram.serial,
-                    RamType::RAM128K => ram_128K += ram.parrallel * ram.serial,
+                    RamType::RAM_SMALLER => ram_smaller += ram.parrallel * ram.serial,
+                    RamType::RAM_LARGER => ram_larger += ram.parrallel * ram.serial,
                 }
             }
 
@@ -309,7 +371,13 @@ fn main() {
                         depth: circuit.ram_mappings[ram].logical_depth,
                         width: circuit.ram_mappings[ram].logical_width,
                     },
-                    RamType::RAM8K,
+                    RamType::RAM_SMALLER,
+                    &LUTRAM_BYTES,
+                    &SMALLER_BYTES,
+                    &LARGER_BYTES,
+                    &SMALLER_WIDTHS,
+                    &LARGER_WIDTHS,
+                    &LUTRAM_WIDTHS,
                 );
 
                 verbose!("Remapped to: {:?}", remap);
@@ -319,9 +387,9 @@ fn main() {
                 //loop back legality check
                 continue;
             }
-            if ram_8K > logic_block_usage / LB_PER_8K {
+            if ram_smaller > logic_block_usage / LB_PER_SMALLER {
                 //calculate how much exceeded
-                let exceeded = ram_8K - (logic_block_usage / LB_PER_8K);
+                let exceeded = ram_smaller - (logic_block_usage / LB_PER_SMALLER);
 
                 verbose!("Circuit {} 8K usage exceeded by: {}!", circuit.id, exceeded);
 
@@ -329,18 +397,21 @@ fn main() {
                 let mut map_to = RamType::LUTRAM;
                 //Vector should be sorted from smallest logical ram to largest, so finding first 8k should be the smallest one to convert now
                 let ram = match circuit.ram_mappings.iter().position(|x| {
-                    x.ram_type == RamType::RAM8K    // Find RAM8K That isn't a truedualport and is not too deep to map to LUTRAM
+                    x.ram_type == RamType::RAM_SMALLER    // Find RAM_SMALLER That isn't a truedualport and is not too deep to map to LUTRAM
                         && x.mode != RamMode::TrueDualPort
                         && x.logical_depth / 64 < 17
+                        && !opt.no_lutram // and if lutram is allowed
                 }) {
                     Some(ram) => ram,
                     None => {
                         /* Could not find valid target to map, try to map to 128K instead*/
-                        map_to = RamType::RAM128K;
+                        map_to = RamType::RAM_LARGER;
                         circuit
                             .ram_mappings
                             .iter()
-                            .position(|x| x.ram_type == RamType::RAM8K)
+                            .rposition(|x| {
+                                x.ram_type == RamType::RAM_SMALLER && bram_larger.ram_size != 0
+                            })
                             .unwrap()
                     }
                 };
@@ -359,6 +430,12 @@ fn main() {
                         width: circuit.ram_mappings[ram].logical_width,
                     },
                     map_to,
+                    &LUTRAM_BYTES,
+                    &SMALLER_BYTES,
+                    &LARGER_BYTES,
+                    &SMALLER_WIDTHS,
+                    &LARGER_WIDTHS,
+                    &LUTRAM_WIDTHS,
                 );
 
                 verbose!("Remapped to: {:?}", remap);
@@ -368,9 +445,9 @@ fn main() {
                 //loop back legality check
                 continue;
             }
-            if ram_128K > logic_block_usage / LB_PER_128K {
+            if ram_larger > logic_block_usage / LB_PER_LARGER && bram_larger.ram_size != 0 {
                 //calculate how much exceeded
-                let exceeded = ram_128K - (logic_block_usage / LB_PER_128K);
+                let exceeded = ram_larger - (logic_block_usage / LB_PER_LARGER);
 
                 verbose!(
                     "Circuit {} 128K usage exceeded by: {}!",
@@ -383,7 +460,7 @@ fn main() {
                 let ram = circuit
                     .ram_mappings
                     .iter()
-                    .position(|x| x.ram_type == RamType::RAM128K)
+                    .position(|x| x.ram_type == RamType::RAM_LARGER)
                     .unwrap();
 
                 verbose!(
@@ -400,7 +477,13 @@ fn main() {
                         depth: circuit.ram_mappings[ram].logical_depth,
                         width: circuit.ram_mappings[ram].logical_width,
                     },
-                    RamType::RAM8K,
+                    RamType::RAM_SMALLER,
+                    &LUTRAM_BYTES,
+                    &SMALLER_BYTES,
+                    &LARGER_BYTES,
+                    &SMALLER_WIDTHS,
+                    &LARGER_WIDTHS,
+                    &LUTRAM_WIDTHS,
                 );
 
                 verbose!("Remapped to: {:?}", remap);
@@ -448,7 +531,7 @@ fn main() {
         }
     }
 
-    let elapsed = start_mapping.elapsed();
+    let elapsed = start.elapsed();
     println!("Time for full run: {:.5?}", elapsed);
 }
 
@@ -495,7 +578,16 @@ fn lb_parse(lb_string: &str) -> Circuit {
     circuit
 }
 
-fn map_ram(parsed: &ParsedRam, map_to: RamType) -> RamMapping {
+fn map_ram(
+    parsed: &ParsedRam,
+    map_to: RamType,
+    LUTRAM_BYTES: &u32,
+    SMALLER_BYTES: &u32,
+    LARGER_BYTES: &u32,
+    SMALLER_WIDTHS: &Vec<u32>,
+    LARGER_WIDTHS: &Vec<u32>,
+    LUTRAM_WIDTHS: &Vec<u32>,
+) -> RamMapping {
     let mut lb_usage = 0;
     let mut serial = 17;
     let mut parrallel = 0;
@@ -504,14 +596,14 @@ fn map_ram(parsed: &ParsedRam, map_to: RamType) -> RamMapping {
 
     let ram_size = match parsed.mode {
         RamMode::TrueDualPort => match map_to {
-            RamType::RAM128K => (RAM128K_BYTES, Vec::from([1, 2, 4, 8, 16, 32, 64])),
-            RamType::RAM8K => (RAM8K_BYTES, Vec::from([1, 2, 4, 8, 16])),
+            RamType::RAM_LARGER => (LARGER_BYTES, LARGER_WIDTHS),
+            RamType::RAM_SMALLER => (SMALLER_BYTES, SMALLER_WIDTHS),
             RamType::LUTRAM => panic!("Error! Cannot map TrueDualPort to LUTRAM!"),
         },
         _ => match map_to {
-            RamType::RAM128K => (RAM128K_BYTES, Vec::from([1, 2, 4, 8, 16, 32, 64, 128])),
-            RamType::RAM8K => (RAM8K_BYTES, Vec::from([1, 2, 4, 8, 16, 32])),
-            RamType::LUTRAM => (LUTRAM_BYTES, Vec::from([10, 20])),
+            RamType::RAM_LARGER => (LARGER_BYTES, LARGER_WIDTHS),
+            RamType::RAM_SMALLER => (SMALLER_BYTES, SMALLER_WIDTHS),
+            RamType::LUTRAM => (LUTRAM_BYTES, LUTRAM_WIDTHS),
         },
     };
 
@@ -526,8 +618,13 @@ fn map_ram(parsed: &ParsedRam, map_to: RamType) -> RamMapping {
         // Width Map
         let mut counter = loop_counter;
         while actual_width == 0 {
-            for try_width in &ram_size.1 {
+            for try_width in ram_size.1 {
                 if try_width * counter / parsed.width >= 1 {
+                    if try_width == ram_size.1.last().unwrap()
+                        && parsed.mode == RamMode::TrueDualPort
+                    {
+                        continue;
+                    }
                     actual_width = try_width.to_owned();
                     parrallel = counter;
                     break;
